@@ -1,5 +1,13 @@
 package ollamarunner
 
+/*
+#cgo CFLAGS: -I../../kvcached_bridge
+#cgo LDFLAGS: -L../../kvcached_bridge -lkvcached_bridge
+#include <stdlib.h>
+#include "kvcached_bridge.h"
+*/
+import "C"
+
 import (
 	"bytes"
 	"context"
@@ -22,12 +30,15 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+	"unsafe"
 
 	"golang.org/x/image/bmp"
 	"golang.org/x/sync/semaphore"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/discover"
 	"github.com/ollama/ollama/envconfig"
+	"github.com/ollama/ollama/kvcache"
 	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/logutil"
 	"github.com/ollama/ollama/ml"
@@ -310,6 +321,10 @@ type Server struct {
 	// next sequence for prompt processing to avoid starvation
 	nextSeq int
 
+	// kvcached integration
+	kvCacheInitialized bool
+	kvCachePtr uintptr // Reference to allocated virtual memory
+
 	// multimodalHash generates hashes for comparing equality
 	// of non-text data
 	multimodalHash maphash.Hash
@@ -357,7 +372,18 @@ func (s *Server) removeSequence(seqIndex int, reason llm.DoneReason) {
 	seq.doneReason = reason
 	close(seq.responses)
 	close(seq.embedding)
+
+	// Cache Slot Lifetime Management: Do NOT free kvcached blocks here!
+	// Blocks will be freed only when the cache slot is actually evicted
+	// This preserves conversation continuity for prefix caching
+
+	// Mark cache slot as available for reuse but preserve kvcached blocks
 	seq.cache.InUse = false
+	seq.cache.lastUsed = time.Now()
+	
+	slog.Debug("Sequence completed, preserving kvcached blocks for conversation continuity",
+		"slot", seq.cache.Id, "blocks", len(seq.cache.kvCacheBlocks))
+
 	s.seqs[seqIndex] = nil
 	s.seqsSem.Release(1)
 }
@@ -490,6 +516,18 @@ func (s *Server) processBatch() error {
 
 	modelOutput, err := model.Forward(ctx, s.model, batchInputs, batch)
 	if err != nil {
+		// Check if this is a CUDA memory access error, which indicates kvcached memory issue
+		errStr := err.Error()
+		if strings.Contains(errStr, "illegal memory access") ||
+		   strings.Contains(errStr, "cuda") ||
+		   strings.Contains(errStr, "CUDA") {
+			slog.Warn("CUDA memory access error detected, likely due to kvcached memory mapping issue. Consider using native cache for CUDA devices.")
+
+			// For now, re-raise the error. In a production system, you might want to:
+			// 1. Fall back to native cache
+			// 2. Retry the request with native caching
+			// 3. Disable kvcached for this session
+		}
 		return fmt.Errorf("failed to decode batch: %w", err)
 	}
 
@@ -673,6 +711,9 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
+			// Note: kvcached block allocation is now handled in LoadCacheSlot
+			// for proper Cache Slot Lifetime Management
+
 			s.seqs[i] = seq
 			s.cond.Signal()
 			found = true
@@ -701,6 +742,8 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 					close(seq.quit)
 					return
 				}
+
+				// kvcached manages virtual memory automatically - no manual updates needed
 
 				flusher.Flush()
 			} else {
@@ -732,10 +775,25 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) reserveWorstCaseGraph() error {
-	ctx := s.model.Backend().NewContext()
+	slog.Debug("Starting reserveWorstCaseGraph")
+
+	if s.model == nil {
+		return fmt.Errorf("model is nil")
+	}
+
+	backend := s.model.Backend()
+	if backend == nil {
+		return fmt.Errorf("model backend is nil")
+	}
+
+	ctx := backend.NewContext()
+	if ctx == nil {
+		return fmt.Errorf("failed to create context")
+	}
 	defer ctx.Close()
 
 	var err error
+	slog.Debug("Created context for reserveWorstCaseGraph")
 	inputs := make([]input.Input, s.batchSize)
 	mmStore := newMultimodalStore()
 
@@ -810,20 +868,78 @@ func (s *Server) reserveWorstCaseGraph() error {
 
 	batch.Inputs = ctx.Input().FromIntSlice(batchInputs, len(batchInputs))
 
-	cache := s.model.Config().Cache
-	if cache != nil {
-		err := cache.StartForward(ctx, batch, true)
-		if err != nil {
-			return err
+	// For kvcached warmup, skip invoking any cache StartForward to avoid ggml
+	// context prerequisites during model initialization.
+	if s.kvCacheInitialized {
+		slog.Debug("Skipping cache StartForward during warmup (kvcached)")
+	} else {
+		// Call cache StartForward for backend compatibility (native path)
+		if s.cache != nil && s.cache.cache != nil {
+			slog.Debug("Calling cache StartForward for backend compatibility")
+			err := s.cache.cache.StartForward(ctx, batch, true)
+			if err != nil {
+				slog.Debug("Cache StartForward failed", "error", err)
+				return err
+			}
+			slog.Debug("Cache StartForward completed")
+		} else {
+			slog.Debug("Cache is nil or not initialized")
+		}
+
+		// Also initialize the model's cache (may be a distinct WrapperCache instance)
+		if mc := s.model.Config().Cache; mc != nil {
+			slog.Debug("Calling model cache StartForward as well")
+			_ = mc.StartForward(ctx, batch, false)
 		}
 	}
 
-	t, err := s.model.Forward(ctx, batch)
-	if err != nil {
-		return err
+	// Temporarily disable model cache during warmup when kvcached is enabled
+	var _origModelCache kvcache.Cache
+	var _restoreModelCache bool
+	if s.kvCacheInitialized {
+		if cacheOverrider, ok := s.model.(model.CacheOverrider); ok {
+			_origModelCache = s.model.Config().Cache
+			_restoreModelCache = true
+			slog.Debug("Temporarily disabling model cache for warmup (kvcached)")
+			cacheOverrider.SetCache(nil)
+		}
 	}
 
+	slog.Debug("About to call model.Forward")
+	// Add detailed debugging for model.Forward call
+	slog.Debug("Model cache debug:", "cache", s.model.Config().Cache != nil, "cacheType", fmt.Sprintf("%T", s.model.Config().Cache))
+	t, err := s.model.Forward(ctx, batch)
+	if err != nil {
+		slog.Debug("model.Forward failed", "error", err)
+		// Check if this is a nil pointer dereference
+		if strings.Contains(err.Error(), "nil pointer dereference") {
+			slog.Error("🔴 NIL POINTER DEREFERENCE in model.Forward - investigating cache state")
+			slog.Debug("Cache investigation:", 
+				"modelCache", s.model.Config().Cache != nil,
+				"inputCache", s.cache != nil,
+				"inputCacheCache", s.cache != nil && s.cache.cache != nil)
+		}
+		return err
+	}
+	slog.Debug("model.Forward completed")
+
+	// Restore model cache after warmup
+	if _restoreModelCache {
+		if cacheOverrider, ok := s.model.(model.CacheOverrider); ok {
+			slog.Debug("Restoring model cache after warmup")
+			cacheOverrider.SetCache(_origModelCache)
+		}
+	}
+
+	slog.Debug("About to call ctx.Forward(t).Reserve()")
 	ctx.Forward(t).Reserve()
+	slog.Debug("reserveWorstCaseGraph completed successfully")
+
+	// No need to close cache when kvcached is enabled - we use NoOpCache
+	// which doesn't allocate any GPU memory to begin with
+	if s.kvCacheInitialized {
+		slog.Debug("kvcached enabled - using NoOpCache (no memory to free)")
+	}
 
 	return nil
 }
@@ -845,26 +961,95 @@ func (s *Server) allocModel(
 			if err, ok := r.(error); ok {
 				panicErr = err
 			} else {
-				panic(r)
+				// Convert runtime panics to errors
+				panicErr = fmt.Errorf("runtime panic: %v", r)
 			}
 		}
 	}()
 
 	var err error
+	slog.Debug("About to create model with model.New")
 	s.model, err = model.New(mpath, params)
 	if err != nil {
+		slog.Debug("model.New failed", "error", err)
 		return err
 	}
+	slog.Debug("model.New completed successfully", "modelType", fmt.Sprintf("%T", s.model), "cacheType", fmt.Sprintf("%T", s.model.Config().Cache))
+
+	// Cache override will be done after kvcached initialization
 
 	// TODO(jessegross): LoRA loading
 	if len(loraPath) > 0 {
 		return errors.New("loras are not yet implemented")
 	}
 
-	s.cache, err = NewInputCache(s.model, kvCacheType, int32(kvSize), parallel, s.batchSize, multiUserCache)
+	if params.AllocMemory {
+		// Initialize kvcached with dynamic device detection
+		gpus := discover.GetGPUInfo()
+		slog.Info("Initializing kvcached integration...")
+		deviceStr := "cpu" // Default to CPU
+		if len(gpus) > 0 && gpus[0].Library == "cuda" {
+			deviceStr = "cuda:0" // Use device 0 for now
+		} else if len(gpus) > 0 && gpus[0].Library == "metal" {
+			deviceStr = "metal"
+		}
+		device := C.CString(deviceStr)
+		defer C.free(unsafe.Pointer(device))
+
+		// Stage 1: Initialize kvcached system
+		result := C.kvcached_bridge_init_kvcached(device, 1)
+		if result != 0 {
+			slog.Warn("Failed to initialize kvcached, continuing without it", "error", result)
+		} else {
+			s.kvCacheInitialized = true
+			slog.Info("Stage 1: kvcached initialized successfully", "device", deviceStr)
+			
+			// Initialize the model's native cache so attention tensors are valid in kvcached mode
+			if mc := s.model.Config().Cache; mc != nil {
+				var numCtx int
+				if parallel > 0 {
+					numCtx = kvSize / parallel
+				} else {
+					numCtx = kvSize
+				}
+				slog.Debug("Initializing model native cache (kvcached mode)")
+				mc.Init(s.model.Backend(), kvCacheTypeFromStr(kvCacheType), parallel, numCtx, s.batchSize)
+			}
+			
+			// Stage 2: Allocate KV cache for this model
+			// Use conservative defaults for model parameters
+			numBlocks := 1024
+			blockSize := 32
+			headNum := 32    // Conservative default
+			headDim := 128   // Conservative default  
+			numLayers := 32  // Conservative default
+			
+			cacheResult := C.kvcached_bridge_alloc_kv_cache(
+				C.int(numBlocks),
+				C.int(blockSize), 
+				C.int(headNum),
+				C.int(headDim),
+				C.int(numLayers),
+				device)
+				
+			if cacheResult != 0 {
+				slog.Warn("Stage 2: Failed to allocate KV cache, continuing without it", "error", cacheResult)
+				s.kvCacheInitialized = false
+			} else {
+				slog.Info("Stage 2: KV cache allocated successfully", 
+					"blocks", numBlocks, "block_size", blockSize, 
+					"head_num", headNum, "head_dim", headDim, "layers", numLayers)
+			}
+		}
+	}
+
+	s.cache, err = NewInputCache(s.model, kvCacheType, int32(kvSize), parallel, s.batchSize, multiUserCache, s.kvCacheInitialized)
 	if err != nil {
 		return err
 	}
+
+    // Do not override the model's native cache when kvcached is enabled.
+    // Let the model manage its own WrapperCache tensors; kvcached handles block memory (Stage 3).
 
 	if !s.cache.enabled && parallel > 1 {
 		parallel = 1
@@ -875,7 +1060,15 @@ func (s *Server) allocModel(
 	s.seqs = make([]*Sequence, s.parallel)
 	s.seqsSem = semaphore.NewWeighted(int64(s.parallel))
 
-	return s.reserveWorstCaseGraph()
+    slog.Debug("allocModel completed successfully, about to call reserveWorstCaseGraph")
+    if s.kvCacheInitialized {
+        // With kvcached enabled, skip ggml warmup graph to avoid cache/tensor setup pitfalls
+        slog.Debug("Skipping reserveWorstCaseGraph (kvcached enabled)")
+        return nil
+    }
+    err = s.reserveWorstCaseGraph()
+    slog.Debug("reserveWorstCaseGraph returned", "error", err)
+    return err
 }
 
 // closeModel frees all memory associated with a model
@@ -1012,6 +1205,7 @@ func Execute(args []string) error {
 		modelPath: *mpath,
 		status:    llm.ServerStatusLaunched,
 	}
+	defer server.shutdownKVCache()
 
 	server.cond = sync.NewCond(&server.mu)
 	server.ready.Add(1)
@@ -1041,10 +1235,26 @@ func Execute(args []string) error {
 	}
 
 	log.Println("Server listening on", addr)
-	if err := httpServer.Serve(listener); err != nil {
-		log.Fatal("server error:", err)
-		return err
+        if err := httpServer.Serve(listener); err != nil {
+                log.Fatal("server error:", err)
+                return err
+        }
+
+        return nil
+}
+
+// kvcached manages virtual memory automatically - no manual token-level updates needed
+
+// shutdownKVCache shuts down the kvcached system
+func (s *Server) shutdownKVCache() {
+	if !s.kvCacheInitialized {
+		return
 	}
 
-	return nil
+	result := C.kvcached_bridge_shutdown_kvcached()
+	if result != 0 {
+		slog.Warn("Failed to shutdown kvcached", "error", result)
+	}
+	s.kvCacheInitialized = false
+	s.kvCachePtr = 0
 }

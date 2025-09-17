@@ -35,6 +35,12 @@ type Model interface {
 	Config() config
 }
 
+// CacheOverrider allows overriding the cache in models that support it
+// This is used by kvcached integration to prevent conflicts
+type CacheOverrider interface {
+	SetCache(kvcache.Cache)
+}
+
 // MultimodalProcessor must be implemented by multimodal models.
 type MultimodalProcessor interface {
 	// EncodeMultimodal processes a single input (such as an image) and
@@ -84,6 +90,12 @@ func (m *Base) Backend() ml.Backend {
 
 func (m *Base) Config() config {
 	return m.config
+}
+
+// SetCache overrides the cache in the model's config
+// This is used by kvcached integration to prevent conflicts
+func (m *Base) SetCache(cache kvcache.Cache) {
+	m.config.Cache = cache
 }
 
 var models = make(map[string]func(fs.Config) (Model, error))

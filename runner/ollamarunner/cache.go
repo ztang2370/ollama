@@ -1,17 +1,35 @@
 package ollamarunner
 
+/*
+#cgo CFLAGS: -I../../kvcached_bridge
+#cgo LDFLAGS: -L../../kvcached_bridge -lkvcached_bridge
+#include <stdlib.h>
+#include "kvcached_bridge.h"
+*/
+import "C"
+
 import (
 	"errors"
 	"fmt"
 	"log/slog"
 	"math"
 	"time"
+	"unsafe"
 
 	"github.com/ollama/ollama/kvcache"
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/model"
 	"github.com/ollama/ollama/model/input"
 )
+
+// Three Stage kvcached Integration (Replaces Native Ollama Cache):
+// Stage 1 (System Startup): Call init_kvcached() in server.go before load()
+// Stage 2 (Model Loading): Call alloc_kv_cache() during allocModel()
+// Stage 3 (Request Processing): Call alloc_kv_bridge()/free_kv_bridge() as needed
+//
+// Memory Management:
+// - When kvcached is enabled: Native cache disabled, kvcached handles all memory
+// - When kvcached is disabled: Fall back to native Ollama cache management
 
 type InputCache struct {
 	// context window size (per slot)
@@ -28,33 +46,61 @@ type InputCache struct {
 	// optimize cache eviction for multiple users
 	multiUserCache bool
 
+	// kvcached enabled flag
+	kvcachedEnabled bool
+
 	cache kvcache.Cache
 }
 
-func NewInputCache(model model.Model, kvCacheType string, kvSize int32, numSlots int, batchSize int, multiUserCache bool) (*InputCache, error) {
+func NewInputCache(model model.Model, kvCacheType string, kvSize int32, numSlots int, batchSize int, multiUserCache bool, kvcachedEnabled bool) (*InputCache, error) {
+	slog.Debug("NewInputCache called", "kvCacheType", kvCacheType, "kvSize", kvSize, "numSlots", numSlots, "batchSize", batchSize, "kvcachedEnabled", kvcachedEnabled)
+
 	numCtx := kvSize / int32(numSlots)
+	slog.Debug("Calculated numCtx", "numCtx", numCtx)
 
 	if numCtx < 1 {
 		return nil, fmt.Errorf("must have at least one kv cache entry per parallel sequence (kv: %v parallel: %v)", kvSize, numSlots)
 	}
 
 	slots := make([]InputCacheSlot, numSlots)
+	slog.Debug("Created cache slots", "numSlots", numSlots)
 
 	for i := range slots {
 		slots[i] = InputCacheSlot{Id: i}
 	}
 
-	cache := model.Config().Cache
-	if cache != nil {
-		cache.Init(model.Backend(), kvCacheTypeFromStr(kvCacheType), numSlots, int(numCtx), batchSize)
-	}
+    // Choose cache implementation
+    var cache kvcache.Cache = nil
+    if kvcachedEnabled {
+        // For correctness, use the model's native WrapperCache so attention gets valid K/V tensors.
+        // kvcached will still manage block memory separately (Stage 3) without interfering here.
+        slog.Info("kvcached enabled - using native WrapperCache for model attention")
+        cache = model.Config().Cache
+        if cache != nil {
+            slog.Debug("Initializing native cache (kvcached mode)", "kvCacheType", kvCacheTypeFromStr(kvCacheType), "numSlots", numSlots, "numCtx", numCtx, "batchSize", batchSize)
+            cache.Init(model.Backend(), kvCacheTypeFromStr(kvCacheType), numSlots, int(numCtx), batchSize)
+        } else {
+            slog.Debug("Model has no native cache - disabling cache")
+        }
+    } else {
+        // Native (non-kvcached) path
+        slog.Info("Using native Ollama cache management")
+        cache = model.Config().Cache
+        if cache != nil {
+            slog.Debug("Initializing native cache", "kvCacheType", kvCacheTypeFromStr(kvCacheType), "numSlots", numSlots, "numCtx", numCtx, "batchSize", batchSize)
+            cache.Init(model.Backend(), kvCacheTypeFromStr(kvCacheType), numSlots, int(numCtx), batchSize)
+        } else {
+            slog.Debug("Model has no native cache - disabling cache")
+        }
+    }
 
 	return &InputCache{
-		numCtx:         numCtx,
-		enabled:        cache != nil,
-		slots:          slots,
-		multiUserCache: multiUserCache,
-		cache:          cache,
+		numCtx:          numCtx,
+		enabled:         cache != nil || kvcachedEnabled,
+		slots:           slots,
+		multiUserCache:  multiUserCache,
+		kvcachedEnabled: kvcachedEnabled,
+		cache:           cache,
 	}, nil
 }
 
@@ -74,7 +120,9 @@ func (c *InputCache) Close() {
 		return
 	}
 
-	c.cache.Close()
+	if c.cache != nil {
+		c.cache.Close()
+	}
 }
 
 // Locking: Operations on InputCacheSlot (including finding one
@@ -93,9 +141,16 @@ type InputCacheSlot struct {
 
 	// last time this cache was used (as of start of processing)
 	lastUsed time.Time
+
+	// kvcached blocks associated with this cache slot
+	// These blocks persist across sequence completions for conversation continuity
+	// and are only freed when the cache slot is actually evicted
+	kvCacheBlocks []int32
 }
 
 func (c *InputCache) LoadCacheSlot(prompt []input.Input) (*InputCacheSlot, []input.Input, error) {
+	slog.Debug("LoadCacheSlot called", "promptLen", len(prompt), "enabled", c.enabled, "cache", c.cache != nil, "kvcachedEnabled", c.kvcachedEnabled)
+
 	var slot *InputCacheSlot
 	var numPast int32
 	var err error
@@ -121,19 +176,38 @@ func (c *InputCache) LoadCacheSlot(prompt []input.Input) (*InputCacheSlot, []inp
 		numPast--
 	}
 
-	if c.cache != nil {
-		if numPast > 0 && !c.cache.CanResume(slot.Id, numPast) {
-			numPast = 0
+	// Memory management: choose between native cache and kvcached
+	if c.kvcachedEnabled {
+		// kvcached memory management (primary mode)
+		slog.Debug("Using kvcached memory management")
+		// Check if we need to reset cache due to conversation mismatch
+		if numPast == 0 && len(slot.kvCacheBlocks) > 0 {
+			// No prefix match - free old blocks and allocate new ones
+			slog.Debug("Conversation mismatch - freeing old kvcached blocks for slot", "slot", slot.Id)
+			c.freeSlotKvcachedBlocks(slot)
 		}
 
-		err = c.cache.Remove(slot.Id, numPast, math.MaxInt32)
-		if err != nil {
-			// Some models don't support partial erasure
-			err = c.cache.Remove(slot.Id, 0, math.MaxInt32)
-			if err != nil {
-				return nil, nil, err
+		// Ensure kvcached blocks are allocated for this conversation
+		slog.Debug("About to call ensureKvcachedBlocks", "slot", slot.Id, "promptLen", len(prompt))
+		c.ensureKvcachedBlocks(slot, len(prompt))
+		slog.Debug("ensureKvcachedBlocks completed", "slot", slot.Id, "allocatedBlocks", len(slot.kvCacheBlocks))
+	} else {
+		// Native Ollama cache management (fallback mode)
+		slog.Debug("Using native cache management")
+		if c.cache != nil {
+			if numPast > 0 && !c.cache.CanResume(slot.Id, numPast) {
+				numPast = 0
 			}
-			numPast = 0
+
+			err = c.cache.Remove(slot.Id, numPast, math.MaxInt32)
+			if err != nil {
+				// Some models don't support partial erasure
+				err = c.cache.Remove(slot.Id, 0, math.MaxInt32)
+				if err != nil {
+					return nil, nil, err
+				}
+				numPast = 0
+			}
 		}
 	}
 
@@ -200,6 +274,9 @@ func (c *InputCache) findBestCacheSlot(prompt []input.Input) (*InputCacheSlot, i
 	if len(oldestSlot.Inputs) != 0 {
 		slog.Debug("evicting cache slot", "id", oldestSlot.Id, "inputs", len(oldestSlot.Inputs),
 			"used", oldestSlot.lastUsed)
+		
+		// Free kvcached blocks when slot is actually evicted
+		c.freeSlotKvcachedBlocks(oldestSlot)
 	}
 
 	if longest > 0 && longestSlot != oldestSlot {
@@ -207,7 +284,7 @@ func (c *InputCache) findBestCacheSlot(prompt []input.Input) (*InputCacheSlot, i
 			len(longestSlot.Inputs))
 		oldestSlot.Inputs = make([]input.Input, longest)
 		copy(oldestSlot.Inputs, longestSlot.Inputs[:longest])
-		if c.cache != nil {
+		if !c.kvcachedEnabled && c.cache != nil {
 			c.cache.CopyPrefix(longestSlot.Id, oldestSlot.Id, longest)
 		}
 	}
@@ -276,7 +353,7 @@ func (c *InputCache) ShiftCacheSlot(slot *InputCacheSlot, numKeep int32) error {
 	slog.Debug("context limit hit - shifting", "id", slot.Id, "limit", c.numCtx, "input", len(slot.Inputs),
 		"keep", numKeep, "discard", discard)
 
-	if c.cache != nil {
+	if !c.kvcachedEnabled && c.cache != nil {
 		err := c.cache.Remove(slot.Id, numKeep, numKeep+discard)
 		if err != nil {
 			slog.Debug("kv cache removal unsupported, clearing cache and returning inputs for reprocessing",
@@ -302,4 +379,91 @@ func (c *InputCache) ShiftCacheSlot(slot *InputCacheSlot, numKeep int32) error {
 	slot.Inputs = slot.Inputs[:inputLen-discard]
 
 	return nil
+}
+
+// freeSlotKvcachedBlocks frees kvcached blocks associated with a cache slot during eviction
+func (c *InputCache) freeSlotKvcachedBlocks(slot *InputCacheSlot) {
+	if len(slot.kvCacheBlocks) > 0 {
+		// Convert Go slice to C array
+		numBlocks := len(slot.kvCacheBlocks)
+		blockIds := make([]C.longlong, numBlocks)
+		for i, blockId := range slot.kvCacheBlocks {
+			blockIds[i] = C.longlong(blockId)
+		}
+
+		// Stage 3: Free blocks using kvcached bridge during slot eviction
+		result := C.kvcached_bridge_free_kv(&blockIds[0], C.int(numBlocks))
+		if result == 0 {
+			slog.Debug("Stage 3: Freed kvcached blocks during slot eviction",
+				"slot", slot.Id, "blocks", numBlocks)
+		} else {
+			slog.Warn("Stage 3: Failed to free kvcached blocks during slot eviction",
+				"slot", slot.Id, "blocks", numBlocks)
+		}
+
+		slot.kvCacheBlocks = nil
+	}
+}
+
+// ensureKvcachedBlocks allocates kvcached blocks for a cache slot if needed
+func (c *InputCache) ensureKvcachedBlocks(slot *InputCacheSlot, promptLen int) {
+	slog.Debug("ensureKvcachedBlocks called", "slotId", slot.Id, "currentBlocks", len(slot.kvCacheBlocks), "promptLen", promptLen)
+
+	if len(slot.kvCacheBlocks) == 0 {
+		// Calculate blocks needed based on conversation context estimation
+		blockSize := int32(32) // Standard kvcached block size
+		
+		// Estimate total tokens needed for this conversation turn
+		promptTokens := int32(promptLen)
+
+		// Conservative estimate for response length (25% of context window)
+		estimatedResponseTokens := c.numCtx / 16
+		
+		// // Add buffer for conversation growth (allow room for future turns)
+		// conversationBuffer := c.numCtx / 2
+		conversationBuffer := int32(0)
+		
+		totalEstimatedTokens := promptTokens + estimatedResponseTokens + conversationBuffer
+
+		slog.Debug("Token estimation", "promptTokens", promptTokens, "estimatedResponseTokens", estimatedResponseTokens, "conversationBuffer", conversationBuffer, "totalEstimatedTokens", totalEstimatedTokens)
+
+		// Convert to blocks (round up)
+		numBlocks := (totalEstimatedTokens + blockSize - 1) / blockSize
+
+		// Ensure we don't exceed cache slot capacity
+		maxBlocks := c.numCtx / blockSize
+		slog.Debug("Block calculation", "numBlocks", numBlocks, "maxBlocks", maxBlocks, "blockSize", blockSize)
+
+		if numBlocks > maxBlocks {
+			slog.Debug("Capping blocks to maxBlocks", "oldNumBlocks", numBlocks, "newNumBlocks", maxBlocks)
+			numBlocks = maxBlocks
+		}
+		if numBlocks < 1 {
+			slog.Debug("Setting minimum blocks to 1")
+			numBlocks = 1
+		}
+
+		slog.Debug("Final block allocation", "numBlocks", numBlocks)
+
+		// Stage 3: Allocate blocks using kvcached bridge for this request
+		slog.Debug("Stage 3: Calling kvcached_bridge_alloc_kv", "numBlocks", numBlocks)
+		blockIdsPtr := C.kvcached_bridge_alloc_kv(C.int(numBlocks))
+		slog.Debug("Stage 3: kvcached_bridge_alloc_kv returned", "blockIdsPtr", blockIdsPtr)
+
+		if blockIdsPtr != nil {
+			// Convert C array to Go slice
+			blockIdsSlice := (*[1 << 30]C.longlong)(unsafe.Pointer(blockIdsPtr))[:numBlocks:numBlocks]
+			slot.kvCacheBlocks = make([]int32, numBlocks)
+			for i := 0; i < int(numBlocks); i++ {
+				slot.kvCacheBlocks[i] = int32(blockIdsSlice[i])
+			}
+			C.free(unsafe.Pointer(blockIdsPtr))
+
+			slog.Debug("Stage 3: Allocated kvcached blocks for cache slot",
+				"slot", slot.Id, "blocks", numBlocks, "prompt_tokens", promptTokens)
+		} else {
+			slog.Warn("Stage 3: Failed to allocate kvcached blocks for cache slot",
+				"slot", slot.Id, "requested_blocks", numBlocks)
+		}
+	}
 }
