@@ -38,7 +38,6 @@ import (
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/discover"
 	"github.com/ollama/ollama/envconfig"
-	"github.com/ollama/ollama/kvcache"
 	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/logutil"
 	"github.com/ollama/ollama/ml"
@@ -893,18 +892,6 @@ func (s *Server) reserveWorstCaseGraph() error {
 		}
 	}
 
-	// Temporarily disable model cache during warmup when kvcached is enabled
-	var _origModelCache kvcache.Cache
-	var _restoreModelCache bool
-	if s.kvCacheInitialized {
-		if cacheOverrider, ok := s.model.(model.CacheOverrider); ok {
-			_origModelCache = s.model.Config().Cache
-			_restoreModelCache = true
-			slog.Debug("Temporarily disabling model cache for warmup (kvcached)")
-			cacheOverrider.SetCache(nil)
-		}
-	}
-
 	slog.Debug("About to call model.Forward")
 	// Add detailed debugging for model.Forward call
 	slog.Debug("Model cache debug:", "cache", s.model.Config().Cache != nil, "cacheType", fmt.Sprintf("%T", s.model.Config().Cache))
@@ -922,14 +909,6 @@ func (s *Server) reserveWorstCaseGraph() error {
 		return err
 	}
 	slog.Debug("model.Forward completed")
-
-	// Restore model cache after warmup
-	if _restoreModelCache {
-		if cacheOverrider, ok := s.model.(model.CacheOverrider); ok {
-			slog.Debug("Restoring model cache after warmup")
-			cacheOverrider.SetCache(_origModelCache)
-		}
-	}
 
 	slog.Debug("About to call ctx.Forward(t).Reserve()")
 	ctx.Forward(t).Reserve()
