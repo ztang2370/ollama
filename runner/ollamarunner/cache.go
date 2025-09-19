@@ -187,10 +187,16 @@ func (c *InputCache) LoadCacheSlot(prompt []input.Input) (*InputCacheSlot, []inp
 			c.freeSlotKvcachedBlocks(slot)
 		}
 
-		// Ensure kvcached blocks are allocated for this conversation
-		slog.Debug("About to call ensureKvcachedBlocks", "slot", slot.Id, "promptLen", len(prompt))
-		c.ensureKvcachedBlocks(slot, len(prompt))
-		slog.Debug("ensureKvcachedBlocks completed", "slot", slot.Id, "allocatedBlocks", len(slot.kvCacheBlocks))
+		// Dynamic allocation with prefix caching preservation
+		if numPast == 0 {
+			// New conversation - free old blocks and allocate fresh
+			slog.Debug("No prefix match - allocating fresh kvcached blocks", "slot", slot.Id, "promptLen", len(prompt))
+			c.ensureKvcachedBlocks(slot, len(prompt))
+		} else {
+			// Prefix match - preserve existing blocks and grow if needed
+			slog.Debug("Prefix match found - preserving and potentially growing kvcached blocks", "slot", slot.Id, "numPast", numPast, "existingBlocks", len(slot.kvCacheBlocks))
+			c.ensureKvcachedBlocks(slot, len(prompt))
+		}
 	} else {
 		// Native Ollama cache management (fallback mode)
 		slog.Debug("Using native cache management")
@@ -353,7 +359,20 @@ func (c *InputCache) ShiftCacheSlot(slot *InputCacheSlot, numKeep int32) error {
 	slog.Debug("context limit hit - shifting", "id", slot.Id, "limit", c.numCtx, "input", len(slot.Inputs),
 		"keep", numKeep, "discard", discard)
 
-	if !c.kvcachedEnabled && c.cache != nil {
+	if c.kvcachedEnabled {
+		// For kvcached mode: free old blocks and reallocate for remaining tokens
+		slog.Debug("Shifting kvcached blocks for slot", "id", slot.Id, "oldBlocks", len(slot.kvCacheBlocks))
+
+		// Free existing blocks
+		c.freeSlotKvcachedBlocks(slot)
+
+		// Reallocate blocks based on remaining tokens
+		remainingTokens := numKeep + inputLen - (numKeep + discard)
+		if remainingTokens > 0 {
+			c.ensureKvcachedBlocks(slot, int(remainingTokens))
+			slog.Debug("Reallocated kvcached blocks after shift", "id", slot.Id, "newBlocks", len(slot.kvCacheBlocks), "remainingTokens", remainingTokens)
+		}
+	} else if c.cache != nil {
 		err := c.cache.Remove(slot.Id, numKeep, numKeep+discard)
 		if err != nil {
 			slog.Debug("kv cache removal unsupported, clearing cache and returning inputs for reprocessing",
@@ -405,65 +424,52 @@ func (c *InputCache) freeSlotKvcachedBlocks(slot *InputCacheSlot) {
 	}
 }
 
-// ensureKvcachedBlocks allocates kvcached blocks for a cache slot if needed
+// ensureKvcachedBlocks allocates or grows kvcached blocks for a cache slot as needed
 func (c *InputCache) ensureKvcachedBlocks(slot *InputCacheSlot, promptLen int) {
 	slog.Debug("ensureKvcachedBlocks called", "slotId", slot.Id, "currentBlocks", len(slot.kvCacheBlocks), "promptLen", promptLen)
 
-	if len(slot.kvCacheBlocks) == 0 {
-		// Calculate blocks needed based on conversation context estimation
-		blockSize := int32(32) // Standard kvcached block size
-		
-		// Estimate total tokens needed for this conversation turn
-		promptTokens := int32(promptLen)
+	// Calculate how many blocks we need for this request
+	blockSize := int32(32) // Standard kvcached block size
+	promptTokens := int32(promptLen)
+	estimatedResponseTokens := c.numCtx / 32  // Conservative estimate
+	conversationBuffer := int32(0)
+	totalEstimatedTokens := promptTokens + estimatedResponseTokens + conversationBuffer
+	neededBlocks := (totalEstimatedTokens + blockSize - 1) / blockSize
 
-		// Conservative estimate for response length (25% of context window)
-		estimatedResponseTokens := c.numCtx / 16
-		
-		// // Add buffer for conversation growth (allow room for future turns)
-		// conversationBuffer := c.numCtx / 2
-		conversationBuffer := int32(0)
-		
-		totalEstimatedTokens := promptTokens + estimatedResponseTokens + conversationBuffer
+	// Cap at max blocks
+	maxBlocks := c.numCtx / blockSize
+	if neededBlocks > maxBlocks {
+		neededBlocks = maxBlocks
+	}
+	if neededBlocks < 1 {
+		neededBlocks = 1
+	}
 
-		slog.Debug("Token estimation", "promptTokens", promptTokens, "estimatedResponseTokens", estimatedResponseTokens, "conversationBuffer", conversationBuffer, "totalEstimatedTokens", totalEstimatedTokens)
+	currentBlocks := int32(len(slot.kvCacheBlocks))
 
-		// Convert to blocks (round up)
-		numBlocks := (totalEstimatedTokens + blockSize - 1) / blockSize
+	if currentBlocks < neededBlocks {
+		// Need to allocate additional blocks
+		blocksToAllocate := neededBlocks - currentBlocks
+		slog.Debug("Growing kvcached blocks", "slotId", slot.Id, "current", currentBlocks, "needed", neededBlocks, "allocating", blocksToAllocate)
 
-		// Ensure we don't exceed cache slot capacity
-		maxBlocks := c.numCtx / blockSize
-		slog.Debug("Block calculation", "numBlocks", numBlocks, "maxBlocks", maxBlocks, "blockSize", blockSize)
-
-		if numBlocks > maxBlocks {
-			slog.Debug("Capping blocks to maxBlocks", "oldNumBlocks", numBlocks, "newNumBlocks", maxBlocks)
-			numBlocks = maxBlocks
-		}
-		if numBlocks < 1 {
-			slog.Debug("Setting minimum blocks to 1")
-			numBlocks = 1
-		}
-
-		slog.Debug("Final block allocation", "numBlocks", numBlocks)
-
-		// Stage 3: Allocate blocks using kvcached bridge for this request
-		slog.Debug("Stage 3: Calling kvcached_bridge_alloc_kv", "numBlocks", numBlocks)
-		blockIdsPtr := C.kvcached_bridge_alloc_kv(C.int(numBlocks))
-		slog.Debug("Stage 3: kvcached_bridge_alloc_kv returned", "blockIdsPtr", blockIdsPtr)
-
+		// Allocate additional blocks
+		blockIdsPtr := C.kvcached_bridge_alloc_kv(C.int(blocksToAllocate))
 		if blockIdsPtr != nil {
-			// Convert C array to Go slice
-			blockIdsSlice := (*[1 << 30]C.longlong)(unsafe.Pointer(blockIdsPtr))[:numBlocks:numBlocks]
-			slot.kvCacheBlocks = make([]int32, numBlocks)
-			for i := 0; i < int(numBlocks); i++ {
-				slot.kvCacheBlocks[i] = int32(blockIdsSlice[i])
+			blockIdsSlice := (*[1 << 30]C.longlong)(unsafe.Pointer(blockIdsPtr))[:blocksToAllocate:blocksToAllocate]
+
+			// Append new block IDs to existing list
+			newBlocks := make([]int32, blocksToAllocate)
+			for i := 0; i < int(blocksToAllocate); i++ {
+				newBlocks[i] = int32(blockIdsSlice[i])
 			}
+			slot.kvCacheBlocks = append(slot.kvCacheBlocks, newBlocks...)
 			C.free(unsafe.Pointer(blockIdsPtr))
 
-			slog.Debug("Stage 3: Allocated kvcached blocks for cache slot",
-				"slot", slot.Id, "blocks", numBlocks, "prompt_tokens", promptTokens)
+			slog.Debug("Grew kvcached blocks for cache slot", "slot", slot.Id, "totalBlocks", len(slot.kvCacheBlocks), "addedBlocks", blocksToAllocate)
 		} else {
-			slog.Warn("Stage 3: Failed to allocate kvcached blocks for cache slot",
-				"slot", slot.Id, "requested_blocks", numBlocks)
+			slog.Warn("Failed to allocate additional kvcached blocks", "slot", slot.Id, "requested", blocksToAllocate)
 		}
+	} else {
+		slog.Debug("Sufficient kvcached blocks already allocated", "slotId", slot.Id, "current", currentBlocks, "needed", neededBlocks)
 	}
 }

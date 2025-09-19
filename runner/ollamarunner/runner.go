@@ -914,10 +914,10 @@ func (s *Server) reserveWorstCaseGraph() error {
 	ctx.Forward(t).Reserve()
 	slog.Debug("reserveWorstCaseGraph completed successfully")
 
-	// No need to close cache when kvcached is enabled - we use NoOpCache
-	// which doesn't allocate any GPU memory to begin with
+	// No need to close cache when kvcached is enabled - we use native WrapperCache
+	// for attention tensors, but kvcached manages block memory allocation/deallocation
 	if s.kvCacheInitialized {
-		slog.Debug("kvcached enabled - using NoOpCache (no memory to free)")
+		slog.Debug("kvcached enabled - native WrapperCache in use (memory managed by kvcached)")
 	}
 
 	return nil
