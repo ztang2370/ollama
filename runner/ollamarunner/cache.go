@@ -77,8 +77,9 @@ func NewInputCache(model model.Model, kvCacheType string, kvSize int32, numSlots
         slog.Info("kvcached enabled - using native WrapperCache for model attention")
         cache = model.Config().Cache
         if cache != nil {
-            slog.Debug("Initializing native cache (kvcached mode)", "kvCacheType", kvCacheTypeFromStr(kvCacheType), "numSlots", numSlots, "numCtx", numCtx, "batchSize", batchSize)
-            cache.Init(model.Backend(), kvCacheTypeFromStr(kvCacheType), numSlots, int(numCtx), batchSize)
+            kvcachedCapacity := int(numCtx)
+            slog.Debug("Initializing native cache (kvcached mode)", "kvCacheType", kvCacheTypeFromStr(kvCacheType), "numSlots", numSlots, "numCtx", numCtx, "kvcachedCapacity", kvcachedCapacity, "batchSize", batchSize)
+            cache.Init(model.Backend(), kvCacheTypeFromStr(kvCacheType), numSlots, kvcachedCapacity, batchSize)
         } else {
             slog.Debug("Model has no native cache - disabling cache")
         }
@@ -193,8 +194,19 @@ func (c *InputCache) LoadCacheSlot(prompt []input.Input) (*InputCacheSlot, []inp
 			slog.Debug("No prefix match - allocating fresh kvcached blocks", "slot", slot.Id, "promptLen", len(prompt))
 			c.ensureKvcachedBlocks(slot, len(prompt))
 		} else {
-			// Prefix match - preserve existing blocks and grow if needed
-			slog.Debug("Prefix match found - preserving and potentially growing kvcached blocks", "slot", slot.Id, "numPast", numPast, "existingBlocks", len(slot.kvCacheBlocks))
+			// Prefix match - clean up tensor cache to match prefix, then allocate blocks
+			if c.cache != nil {
+				err = c.cache.Remove(slot.Id, numPast, math.MaxInt32)
+				if err != nil {
+					// Some models don't support partial erasure
+					err = c.cache.Remove(slot.Id, 0, math.MaxInt32)
+					if err != nil {
+						return nil, nil, err
+					}
+					numPast = 0
+				}
+			}
+			slog.Debug("Prefix match found - cleaned tensor cache, allocating kvcached blocks", "slot", slot.Id, "numPast", numPast, "promptLen", len(prompt), "existingBlocks", len(slot.kvCacheBlocks))
 			c.ensureKvcachedBlocks(slot, len(prompt))
 		}
 	} else {
@@ -360,17 +372,107 @@ func (c *InputCache) ShiftCacheSlot(slot *InputCacheSlot, numKeep int32) error {
 		"keep", numKeep, "discard", discard)
 
 	if c.kvcachedEnabled {
-		// For kvcached mode: free old blocks and reallocate for remaining tokens
+		// For kvcached mode: preserve prefix caching by adjusting block allocation dynamically
 		slog.Debug("Shifting kvcached blocks for slot", "id", slot.Id, "oldBlocks", len(slot.kvCacheBlocks))
 
-		// Free existing blocks
-		c.freeSlotKvcachedBlocks(slot)
-
-		// Reallocate blocks based on remaining tokens
+		// Calculate how many blocks we need for remaining tokens after shift
 		remainingTokens := numKeep + inputLen - (numKeep + discard)
 		if remainingTokens > 0 {
-			c.ensureKvcachedBlocks(slot, int(remainingTokens))
-			slog.Debug("Reallocated kvcached blocks after shift", "id", slot.Id, "newBlocks", len(slot.kvCacheBlocks), "remainingTokens", remainingTokens)
+			// Calculate needed blocks for remaining tokens
+			blockSize := int32(32) // Standard kvcached block size
+			promptTokens := int32(remainingTokens)
+			estimatedResponseTokens := c.numCtx / 32  // Conservative estimate
+			conversationBuffer := int32(0)
+			totalEstimatedTokens := promptTokens + estimatedResponseTokens + conversationBuffer
+			neededBlocks := (totalEstimatedTokens + blockSize - 1) / blockSize
+
+			// Cap at max blocks
+			maxBlocks := c.numCtx / blockSize
+			if neededBlocks > maxBlocks {
+				neededBlocks = maxBlocks
+			}
+			if neededBlocks < 1 {
+				neededBlocks = 1
+			}
+
+			currentBlocks := int32(len(slot.kvCacheBlocks))
+
+			if currentBlocks > neededBlocks {
+				// Need to free excess blocks
+				blocksToFree := currentBlocks - neededBlocks
+				slog.Debug("Freeing excess kvcached blocks", "slotId", slot.Id, "current", currentBlocks, "needed", neededBlocks, "freeing", blocksToFree)
+
+				// Free excess blocks from the end
+				excessBlocks := slot.kvCacheBlocks[neededBlocks:]
+				slot.kvCacheBlocks = slot.kvCacheBlocks[:neededBlocks]
+
+				if len(excessBlocks) > 0 {
+					// Convert Go slice to C array
+					blockIds := make([]C.longlong, len(excessBlocks))
+					for i, blockId := range excessBlocks {
+						blockIds[i] = C.longlong(blockId)
+					}
+
+					// Free excess blocks
+					result := C.kvcached_bridge_free_kv(&blockIds[0], C.int(len(excessBlocks)))
+					if result != 0 {
+						slog.Warn("Failed to free excess kvcached blocks", "slot", slot.Id, "blocks", len(excessBlocks))
+					} else {
+						slog.Debug("Freed excess kvcached blocks", "slot", slot.Id, "freed", len(excessBlocks))
+					}
+				}
+			} else if currentBlocks < neededBlocks {
+				// Need to allocate additional blocks (preserve existing)
+				blocksToAllocate := neededBlocks - currentBlocks
+				slog.Debug("Growing kvcached blocks during shift", "slotId", slot.Id, "current", currentBlocks, "needed", neededBlocks, "allocating", blocksToAllocate)
+
+				// Allocate additional blocks
+				blockIdsPtr := C.kvcached_bridge_alloc_kv(C.int(blocksToAllocate))
+				if blockIdsPtr != nil {
+					blockIdsSlice := (*[1 << 30]C.longlong)(unsafe.Pointer(blockIdsPtr))[:blocksToAllocate:blocksToAllocate]
+
+					// Append new block IDs to existing list
+					newBlocks := make([]int32, blocksToAllocate)
+					for i := 0; i < int(blocksToAllocate); i++ {
+						newBlocks[i] = int32(blockIdsSlice[i])
+					}
+					slot.kvCacheBlocks = append(slot.kvCacheBlocks, newBlocks...)
+					C.free(unsafe.Pointer(blockIdsPtr))
+
+					slog.Debug("Grew kvcached blocks during shift", "slot", slot.Id, "totalBlocks", len(slot.kvCacheBlocks), "addedBlocks", blocksToAllocate)
+				} else {
+					slog.Warn("Failed to allocate additional kvcached blocks during shift", "slot", slot.Id, "requested", blocksToAllocate)
+				}
+			} else {
+				// Current allocation is sufficient, preserve prefix caching
+				slog.Debug("Sufficient kvcached blocks already allocated during shift", "slotId", slot.Id, "current", currentBlocks, "needed", neededBlocks)
+			}
+		} else {
+			// No remaining tokens, free all blocks
+			slog.Debug("No remaining tokens after shift, freeing all kvcached blocks", "slot", slot.Id)
+			c.freeSlotKvcachedBlocks(slot)
+		}
+
+		// In kvcached mode, we still need to update the tensor cache bookkeeping
+		// to synchronize cell ownership with the shifted sequence positions.
+		// kvcached manages the actual GPU memory, but the tensor cache tracks which
+		// cells belong to which sequences for attention operations.
+		err := c.cache.Remove(slot.Id, numKeep, numKeep+discard)
+		if err != nil {
+			slog.Debug("kv cache removal unsupported, clearing cache and returning inputs for reprocessing",
+				"id", slot.Id, "error", err)
+
+			// Create new input slice with preserved tokens (numKeep + remaining tokens after discard)
+			newInputs := make([]input.Input, numKeep+inputLen-(numKeep+discard))
+			copy(newInputs[:numKeep], slot.Inputs[:numKeep])
+			copy(newInputs[numKeep:], slot.Inputs[numKeep+discard:])
+
+			// Reset the cache
+			_ = c.cache.Remove(slot.Id, 0, math.MaxInt32)
+			slot.Inputs = []input.Input{}
+
+			// Return error with inputs that need to be reprocessed
+			return &ErrReprocessInputs{Inputs: newInputs}
 		}
 	} else if c.cache != nil {
 		err := c.cache.Remove(slot.Id, numKeep, numKeep+discard)
