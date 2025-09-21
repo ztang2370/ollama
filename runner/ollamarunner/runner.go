@@ -892,30 +892,13 @@ func (s *Server) reserveWorstCaseGraph() error {
 		}
 	}
 
-	slog.Debug("About to call model.Forward")
-	// Add detailed debugging for model.Forward call
-	slog.Debug("Model cache debug:", "cache", s.model.Config().Cache != nil, "cacheType", fmt.Sprintf("%T", s.model.Config().Cache))
 	t, err := s.model.Forward(ctx, batch)
 	if err != nil {
-		slog.Debug("model.Forward failed", "error", err)
-		// Check if this is a nil pointer dereference
-		if strings.Contains(err.Error(), "nil pointer dereference") {
-			slog.Error("🔴 NIL POINTER DEREFERENCE in model.Forward - investigating cache state")
-			slog.Debug("Cache investigation:", 
-				"modelCache", s.model.Config().Cache != nil,
-				"inputCache", s.cache != nil,
-				"inputCacheCache", s.cache != nil && s.cache.cache != nil)
-		}
 		return err
 	}
-	slog.Debug("model.Forward completed")
 
-	slog.Debug("About to call ctx.Forward(t).Reserve()")
 	ctx.Forward(t).Reserve()
-	slog.Debug("reserveWorstCaseGraph completed successfully")
 
-	// No need to close cache when kvcached is enabled - we use native WrapperCache
-	// for attention tensors, but kvcached manages block memory allocation/deallocation
 	if s.kvCacheInitialized {
 		slog.Debug("kvcached enabled - native WrapperCache in use (memory managed by kvcached)")
 	}
@@ -947,13 +930,10 @@ func (s *Server) allocModel(
 	}()
 
 	var err error
-	slog.Debug("About to create model with model.New")
 	s.model, err = model.New(mpath, params)
 	if err != nil {
-		slog.Debug("model.New failed", "error", err)
 		return err
 	}
-	slog.Debug("model.New completed successfully", "modelType", fmt.Sprintf("%T", s.model), "cacheType", fmt.Sprintf("%T", s.model.Config().Cache))
 
 	// TODO(jessegross): LoRA loading
 	if len(loraPath) > 0 {
@@ -1040,15 +1020,13 @@ func (s *Server) allocModel(
 	s.seqs = make([]*Sequence, s.parallel)
 	s.seqsSem = semaphore.NewWeighted(int64(s.parallel))
 
-    slog.Debug("allocModel completed successfully, about to call reserveWorstCaseGraph")
     if s.kvCacheInitialized {
         // With kvcached enabled, skip ggml warmup graph to avoid cache/tensor setup pitfalls
         slog.Debug("Skipping reserveWorstCaseGraph (kvcached enabled)")
         return nil
     }
-    err = s.reserveWorstCaseGraph()
-    slog.Debug("reserveWorstCaseGraph returned", "error", err)
-    return err
+	
+    return s.reserveWorstCaseGraph()
 }
 
 // closeModel frees all memory associated with a model

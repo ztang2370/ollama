@@ -22,15 +22,6 @@ import (
 	"github.com/ollama/ollama/model/input"
 )
 
-// Three Stage kvcached Integration (Replaces Native Ollama Cache):
-// Stage 1 (System Startup): Call init_kvcached() in server.go before load()
-// Stage 2 (Model Loading): Call alloc_kv_cache() during allocModel()
-// Stage 3 (Request Processing): Call alloc_kv_bridge()/free_kv_bridge() as needed
-//
-// Memory Management:
-// - When kvcached is enabled: Native cache disabled, kvcached handles all memory
-// - When kvcached is disabled: Fall back to native Ollama cache management
-
 type InputCache struct {
 	// context window size (per slot)
 	numCtx int32
@@ -382,8 +373,7 @@ func (c *InputCache) ShiftCacheSlot(slot *InputCacheSlot, numKeep int32) error {
 			blockSize := int32(32) // Standard kvcached block size
 			promptTokens := int32(remainingTokens)
 			estimatedResponseTokens := c.numCtx / 32  // Conservative estimate
-			conversationBuffer := int32(0)
-			totalEstimatedTokens := promptTokens + estimatedResponseTokens + conversationBuffer
+			totalEstimatedTokens := promptTokens + estimatedResponseTokens
 			neededBlocks := (totalEstimatedTokens + blockSize - 1) / blockSize
 
 			// Cap at max blocks
@@ -534,8 +524,7 @@ func (c *InputCache) ensureKvcachedBlocks(slot *InputCacheSlot, promptLen int) {
 	blockSize := int32(32) // Standard kvcached block size
 	promptTokens := int32(promptLen)
 	estimatedResponseTokens := c.numCtx / 32  // Conservative estimate
-	conversationBuffer := int32(0)
-	totalEstimatedTokens := promptTokens + estimatedResponseTokens + conversationBuffer
+	totalEstimatedTokens := promptTokens + estimatedResponseTokens
 	neededBlocks := (totalEstimatedTokens + blockSize - 1) / blockSize
 
 	// Cap at max blocks
