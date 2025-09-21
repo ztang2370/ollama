@@ -5,6 +5,23 @@
 extern "C" {
 #endif
 
+// Operation types for the bridge message
+typedef enum {
+    BRIDGE_OP_INIT = 0,
+    BRIDGE_OP_ALLOC_KV_CACHE = 1,
+    BRIDGE_OP_ALLOC_KV_BRIDGE = 2,
+    BRIDGE_OP_FREE_KV = 3,
+    BRIDGE_OP_SHUTDOWN = 4
+} bridge_operation_t;
+
+// Logging levels for the bridge
+typedef enum {
+    LOG_DEBUG = 0,
+    LOG_INFO = 1,
+    LOG_WARN = 2,
+    LOG_ERROR = 3
+} log_level_t;
+
 // Initialize the Python bridge
 int kvcached_bridge_init();
 
@@ -25,6 +42,9 @@ int kvcached_bridge_shutdown_kvcached();
 
 // Cleanup function
 void kvcached_bridge_cleanup();
+
+// Set logging level (0=DEBUG, 1=INFO, 2=WARN, 3=ERROR)
+void kvcached_bridge_set_log_level(int level);
 
 #ifdef __cplusplus
 }

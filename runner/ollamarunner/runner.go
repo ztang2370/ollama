@@ -955,8 +955,6 @@ func (s *Server) allocModel(
 	}
 	slog.Debug("model.New completed successfully", "modelType", fmt.Sprintf("%T", s.model), "cacheType", fmt.Sprintf("%T", s.model.Config().Cache))
 
-	// Cache override will be done after kvcached initialization
-
 	// TODO(jessegross): LoRA loading
 	if len(loraPath) > 0 {
 		return errors.New("loras are not yet implemented")
@@ -996,12 +994,18 @@ func (s *Server) allocModel(
 			}
 			
 			// Stage 2: Allocate KV cache for this model
-			// Use conservative defaults for model parameters
-			numBlocks := 1024
-			blockSize := 32
-			headNum := 32    // Conservative default
-			headDim := 128   // Conservative default  
-			numLayers := 32  // Conservative default
+			// Get model-specific parameters for KV cache allocation
+			config := s.model.Backend().Config()
+			numBlocks := 1024  // Cache capacity parameter (may be adjusted based on memory)
+			blockSize := 32    // Block size parameter
+			headNum := int(config.Uint("attention.head_count_kv"))   // KV heads from model
+			headDim := int(config.Uint("attention.key_length"))      // Head dimension from model
+			numLayers := int(config.Uint("block_count"))            // Number of layers from model
+
+			slog.Info("Stage 2: Allocating KV cache with model parameters",
+				"model_arch", config.Architecture(),
+				"head_num", headNum, "head_dim", headDim, "layers", numLayers,
+				"num_blocks", numBlocks, "block_size", blockSize)
 			
 			cacheResult := C.kvcached_bridge_alloc_kv_cache(
 				C.int(numBlocks),
@@ -1026,9 +1030,6 @@ func (s *Server) allocModel(
 	if err != nil {
 		return err
 	}
-
-    // Do not override the model's native cache when kvcached is enabled.
-    // Let the model manage its own WrapperCache tensors; kvcached handles block memory (Stage 3).
 
 	if !s.cache.enabled && parallel > 1 {
 		parallel = 1

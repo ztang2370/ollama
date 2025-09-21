@@ -3,14 +3,45 @@
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
+#include "kvcached_bridge.h"
+#include <stdarg.h>
 
 // Global Python module reference and thread state
 static PyObject* kvcached_module = NULL;
 static PyThreadState* main_thread_state = NULL;
 
+// Global logging level - can be changed at runtime
+static log_level_t current_log_level = LOG_INFO;
+
+// Simple logging utility function
+void cbridge_log(log_level_t level, const char* fmt, ...) {
+    if (level < current_log_level) {
+        return;  // Skip messages below current log level
+    }
+
+    // Level prefix
+    const char* level_str;
+    switch (level) {
+        case LOG_DEBUG: level_str = "DEBUG"; break;
+        case LOG_INFO:  level_str = "INFO";  break;
+        case LOG_WARN:  level_str = "WARN";  break;
+        case LOG_ERROR: level_str = "ERROR"; break;
+        default:        level_str = "UNKNOWN"; break;
+    }
+
+    fprintf(stderr, "C_BRIDGE [%s]: ", level_str);
+
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+
+    fprintf(stderr, "\n");
+}
+
 // Synchronous bridge using dedicated thread
 typedef struct {
-    int type;  // 0=init, 1=alloc_kv_cache, 2=alloc_kv_bridge, 3=free_kv, 4=shutdown
+    bridge_operation_t type;  // Operation type enum
     union {
         struct {
             const char* device;
@@ -55,7 +86,7 @@ void* python_thread_func(void* arg) {
     pthread_cond_signal(&init_cond);
     pthread_mutex_unlock(&queue_mutex);
 
-    fprintf(stderr, "C_BRIDGE: Python thread started\n");
+    cbridge_log(LOG_DEBUG, "Python thread started");
 
     while (!shutdown_requested) {
         // Wait for a message
@@ -75,18 +106,15 @@ void* python_thread_func(void* arg) {
 
         // Process the message
         switch (msg->type) {
-            case 0: { // init_kvcached
-                fprintf(stderr, "C_BRIDGE: Python thread processing init message\n");
+            case BRIDGE_OP_INIT: { // init_kvcached
+                cbridge_log(LOG_DEBUG, "processing init message");
                 PyEval_RestoreThread(main_thread_state);
 
                 // kvcached_module is already imported in main thread
-                fprintf(stderr, "C_BRIDGE: kvcached_module = %p\n", kvcached_module);
 
                 if (kvcached_module) {
                     // Call init_kvcached
-                    fprintf(stderr, "C_BRIDGE: Calling init_kvcached function\n");
                     PyObject* pFunc = PyObject_GetAttrString(kvcached_module, "init_kvcached");
-                    fprintf(stderr, "C_BRIDGE: pFunc = %p\n", pFunc);
                     if (pFunc && PyCallable_Check(pFunc)) {
                         PyObject* pArgs = PyTuple_New(5);
                         PyTuple_SetItem(pArgs, 0, PyLong_FromLong(0));
@@ -95,37 +123,35 @@ void* python_thread_func(void* arg) {
                         PyTuple_SetItem(pArgs, 3, PyUnicode_FromString(msg->data.init.device));
                         PyTuple_SetItem(pArgs, 4, PyBool_FromLong(msg->data.init.async_sched));
 
-                        fprintf(stderr, "C_BRIDGE: Calling Python function\n");
                         PyObject* pResult = PyObject_CallObject(pFunc, pArgs);
-                        fprintf(stderr, "C_BRIDGE: pResult = %p\n", pResult);
                         if (pResult) {
-                            fprintf(stderr, "C_BRIDGE: init_kvcached succeeded\n");
+                            cbridge_log(LOG_DEBUG, "init_kvcached succeeded");
                             msg->result = 0;
                             Py_DECREF(pResult);
                         } else {
-                            fprintf(stderr, "C_BRIDGE: init_kvcached failed\n");
+                            cbridge_log(LOG_ERROR, "init_kvcached failed");
                             msg->result = -1;
                             PyErr_Print();
                         }
                         Py_DECREF(pArgs);
                         Py_DECREF(pFunc);
                     } else {
-                        fprintf(stderr, "C_BRIDGE: Cannot find init_kvcached function\n");
+                        cbridge_log(LOG_ERROR, "cannot find init_kvcached function");
                         msg->result = -1;
                     }
                 } else {
-                    fprintf(stderr, "C_BRIDGE: Failed to import kvcached module\n");
+                    cbridge_log(LOG_ERROR, "failed to import kvcached module");
                     msg->result = -1;
                     PyErr_Print();
                 }
 
                 main_thread_state = PyEval_SaveThread();
-                fprintf(stderr, "C_BRIDGE: Finished processing init message, result=%d\n", msg->result);
+                cbridge_log(LOG_DEBUG, "finished processing init message, result=%d", msg->result);
                 msg->processed = 1;
                 break;
             }
-            case 1: { // alloc_kv_cache
-                fprintf(stderr, "C_BRIDGE: Python thread processing alloc_kv_cache message\n");
+            case BRIDGE_OP_ALLOC_KV_CACHE: { // alloc_kv_cache
+                cbridge_log(LOG_DEBUG, "processing alloc_kv_cache message");
                 PyEval_RestoreThread(main_thread_state);
 
                 if (kvcached_module) {
@@ -149,22 +175,22 @@ void* python_thread_func(void* arg) {
 
                         PyObject* pResult = PyObject_CallObject(pFunc, pArgs);
                         if (pResult && PyList_Check(pResult)) {
-                            fprintf(stderr, "C_BRIDGE: alloc_kv_cache succeeded\n");
+                            cbridge_log(LOG_DEBUG, "alloc_kv_cache succeeded");
                             msg->result = 0;
                             Py_DECREF(pResult);
                         } else {
-                            fprintf(stderr, "C_BRIDGE: alloc_kv_cache failed\n");
+                            cbridge_log(LOG_ERROR, "alloc_kv_cache failed");
                             msg->result = -1;
                             PyErr_Print();
                         }
                         Py_DECREF(pArgs);
                         Py_DECREF(pFunc);
                     } else {
-                        fprintf(stderr, "C_BRIDGE: Cannot find alloc_kv_cache function\n");
+                        cbridge_log(LOG_ERROR, "cannot find alloc_kv_cache function");
                         msg->result = -1;
                     }
                 } else {
-                    fprintf(stderr, "C_BRIDGE: kvcached module not available\n");
+                    cbridge_log(LOG_ERROR, "kvcached module not available");
                     msg->result = -1;
                 }
 
@@ -172,7 +198,7 @@ void* python_thread_func(void* arg) {
                 msg->processed = 1;
                 break;
             }
-            case 2: { // alloc_kv_bridge
+            case BRIDGE_OP_ALLOC_KV_BRIDGE: { // alloc_kv_bridge
                 PyEval_RestoreThread(main_thread_state);
 
                 if (kvcached_module) {
@@ -215,7 +241,7 @@ void* python_thread_func(void* arg) {
                 msg->processed = 1;
                 break;
             }
-            case 3: { // free_kv
+            case BRIDGE_OP_FREE_KV: { // free_kv
                 PyEval_RestoreThread(main_thread_state);
 
                 if (kvcached_module) {
@@ -252,7 +278,7 @@ void* python_thread_func(void* arg) {
                 msg->processed = 1;
                 break;
             }
-            case 4: { // shutdown
+            case BRIDGE_OP_SHUTDOWN: { // shutdown
                 PyEval_RestoreThread(main_thread_state);
 
                 if (kvcached_module) {
@@ -287,30 +313,30 @@ void* python_thread_func(void* arg) {
     }
     Py_Finalize();
 
-    fprintf(stderr, "C_BRIDGE: Python thread exiting\n");
+    cbridge_log(LOG_DEBUG, "Python thread exiting");
     return NULL;
 }
 
 // Initialize the synchronous bridge
 int bridge_init() {
-    fprintf(stderr, "C_BRIDGE: bridge_init called\n");
+    cbridge_log(LOG_DEBUG, "bridge_init called");
 
     if (thread_running) {
-        fprintf(stderr, "C_BRIDGE: thread already running\n");
+        cbridge_log(LOG_DEBUG, "thread already running");
         return 0;
     }
 
     // Initialize Python in the main thread
     if (!Py_IsInitialized()) {
-        fprintf(stderr, "C_BRIDGE: initializing Python\n");
+        cbridge_log(LOG_INFO, "initializing Python");
         Py_InitializeEx(1);
         if (!Py_IsInitialized()) {
-            fprintf(stderr, "C_BRIDGE: Python initialization failed\n");
+            cbridge_log(LOG_ERROR, "Python initialization failed");
             return -1;
         }
         PyEval_InitThreads();
         main_thread_state = PyEval_SaveThread();
-        fprintf(stderr, "C_BRIDGE: Python initialized in main thread\n");
+        cbridge_log(LOG_INFO, "Python initialized in main thread");
 
         // Import the kvcached module while we have the GIL
         PyEval_RestoreThread(main_thread_state);
@@ -330,12 +356,12 @@ int bridge_init() {
 
         kvcached_module = PyImport_ImportModule("kvcached.integration.ollama.interfaces");
         if (!kvcached_module) {
-            fprintf(stderr, "C_BRIDGE: failed to import kvcached module\n");
+            cbridge_log(LOG_ERROR, "failed to import kvcached module");
             PyErr_Print();
             main_thread_state = PyEval_SaveThread();
             return -1;
         }
-        fprintf(stderr, "C_BRIDGE: kvcached module imported successfully\n");
+        cbridge_log(LOG_INFO, "kvcached module imported successfully");
         main_thread_state = PyEval_SaveThread();
     }
 
@@ -343,24 +369,24 @@ int bridge_init() {
     current_message = NULL;
     thread_initialized = 0;
 
-    fprintf(stderr, "C_BRIDGE: creating Python thread\n");
+    cbridge_log(LOG_INFO, "creating Python thread");
 
     if (pthread_create(&python_thread, NULL, python_thread_func, NULL) != 0) {
-        fprintf(stderr, "C_BRIDGE: failed to create thread\n");
+        cbridge_log(LOG_ERROR, "failed to create thread");
         return -1;
     }
 
     thread_running = 1;
 
     // Wait for thread to initialize
-    fprintf(stderr, "C_BRIDGE: waiting for thread initialization\n");
+    cbridge_log(LOG_DEBUG, "waiting for thread initialization");
     pthread_mutex_lock(&queue_mutex);
     while (!thread_initialized) {
         pthread_cond_wait(&init_cond, &queue_mutex);
     }
     pthread_mutex_unlock(&queue_mutex);
 
-    fprintf(stderr, "C_BRIDGE: Python thread fully initialized\n");
+    cbridge_log(LOG_INFO, "Python thread fully initialized");
 
     return 0;
 }
@@ -391,32 +417,32 @@ int kvcached_bridge_init() {
 
 // Call Python init_kvcached function
 int kvcached_bridge_init_kvcached(const char* device, int async_sched) {
-    fprintf(stderr, "C_BRIDGE: init_kvcached called with device=%s, async_sched=%d\n", device, async_sched);
+    cbridge_log(LOG_INFO, "init_kvcached called with device=%s, async_sched=%d", device, async_sched);
 
     // Initialize bridge if not already done
     if (kvcached_bridge_init() != 0) {
-        fprintf(stderr, "C_BRIDGE: bridge_init failed\n");
+        cbridge_log(LOG_ERROR, "bridge_init failed");
         return -1;
     }
 
     bridge_message_t msg;
-    msg.type = 0; // init
+    msg.type = BRIDGE_OP_INIT;
     msg.data.init.device = device;
     msg.data.init.async_sched = async_sched;
 
-    fprintf(stderr, "C_BRIDGE: init_kvcached calling Python thread\n");
+    cbridge_log(LOG_DEBUG, "init_kvcached calling Python thread");
     int result = send_message(&msg);
-    fprintf(stderr, "C_BRIDGE: init_kvcached result=%d\n", result);
+    cbridge_log(LOG_INFO, "init_kvcached result=%d", result);
     return result;
 }
 
 // Call Python alloc_kv_cache function (Stage 2)
 int kvcached_bridge_alloc_kv_cache(int num_blocks, int block_size, int head_num, int head_dim, int num_layers, const char* device) {
-    fprintf(stderr, "C_BRIDGE: alloc_kv_cache called with num_blocks=%d, block_size=%d, head_num=%d, head_dim=%d, num_layers=%d, device=%s\n", 
-            num_blocks, block_size, head_num, head_dim, num_layers, device);
+    cbridge_log(LOG_INFO, "alloc_kv_cache called: blocks=%d, head=(%d,%d), layers=%d, device=%s",
+                num_blocks, head_num, head_dim, num_layers, device);
 
     bridge_message_t msg;
-    msg.type = 1; // alloc_kv_cache
+    msg.type = BRIDGE_OP_ALLOC_KV_CACHE;
     msg.data.alloc_cache.num_blocks = num_blocks;
     msg.data.alloc_cache.block_size = block_size;
     msg.data.alloc_cache.head_num = head_num;
@@ -425,16 +451,16 @@ int kvcached_bridge_alloc_kv_cache(int num_blocks, int block_size, int head_num,
     msg.data.alloc_cache.device = device;
 
     int result = send_message(&msg);
-    fprintf(stderr, "C_BRIDGE: alloc_kv_cache result=%d\n", result);
+    cbridge_log(LOG_INFO, "alloc_kv_cache result=%d", result);
     return result;
 }
 
 // Call Python shutdown_kvcached function
 int kvcached_bridge_shutdown_kvcached() {
-    fprintf(stderr, "C_BRIDGE: shutdown_kvcached called\n");
+    cbridge_log(LOG_INFO, "shutdown_kvcached called");
 
     bridge_message_t msg;
-    msg.type = 4; // shutdown
+    msg.type = BRIDGE_OP_SHUTDOWN;
 
     int result = send_message(&msg);
 
@@ -451,20 +477,20 @@ int kvcached_bridge_shutdown_kvcached() {
 
 // Call Python alloc_kv function (allocate blocks for a request)
 long long* kvcached_bridge_alloc_kv(int num_blocks) {
-    fprintf(stderr, "C_BRIDGE: alloc_kv called\n");
+    cbridge_log(LOG_DEBUG, "alloc_kv called for %d blocks", num_blocks);
 
     bridge_message_t msg;
-    msg.type = 2; // alloc_kv_bridge
+    msg.type = BRIDGE_OP_ALLOC_KV_BRIDGE;
     msg.data.alloc_bridge.num_blocks = num_blocks;
     msg.result_blocks = NULL;
 
     int result = send_message(&msg);
 
     if (result == 0 && msg.result_blocks) {
-        fprintf(stderr, "C_BRIDGE: alloc_kv succeeded\n");
+        cbridge_log(LOG_DEBUG, "alloc_kv succeeded");
         return msg.result_blocks;
     } else {
-        fprintf(stderr, "C_BRIDGE: alloc_kv failed, falling back to dummy allocation\n");
+        cbridge_log(LOG_WARN, "alloc_kv failed, falling back to dummy allocation");
         long long* dummy = (long long*)malloc(num_blocks * sizeof(long long));
         if (dummy) {
             for (int i = 0; i < num_blocks; i++) {
@@ -481,12 +507,20 @@ int kvcached_bridge_free_kv(long long* block_ids, int num_blocks) {
         return -1;
     }
 
-    fprintf(stderr, "C_BRIDGE: free_kv called\n");
+    cbridge_log(LOG_DEBUG, "free_kv called for %d blocks", num_blocks);
 
     bridge_message_t msg;
-    msg.type = 3; // free_kv
+    msg.type = BRIDGE_OP_FREE_KV;
     msg.data.free.block_ids = block_ids;
     msg.data.free.num_blocks = num_blocks;
 
     return send_message(&msg);
+}
+
+// Set logging level at runtime
+void kvcached_bridge_set_log_level(int level) {
+    if (level >= LOG_DEBUG && level <= LOG_ERROR) {
+        current_log_level = (log_level_t)level;
+        cbridge_log(LOG_INFO, "Log level set to %d", level);
+    }
 }
