@@ -941,67 +941,73 @@ func (s *Server) allocModel(
 	}
 
 	if params.AllocMemory {
-		// Initialize kvcached with dynamic device detection
-		gpus := discover.GetGPUInfo()
-		slog.Info("Initializing kvcached integration...")
-		deviceStr := "cpu" // Default to CPU
-		if len(gpus) > 0 && gpus[0].Library == "cuda" {
-			deviceStr = "cuda:0" // Use device 0 for now
-		} else if len(gpus) > 0 && gpus[0].Library == "metal" {
-			deviceStr = "metal"
-		}
-		device := C.CString(deviceStr)
-		defer C.free(unsafe.Pointer(device))
+		// Check if kvcached is enabled via environment variable
+		enableKVCached := strings.ToLower(os.Getenv("ENABLE_KVCACHED")) == "true" ||
+			os.Getenv("ENABLE_KVCACHED") == "1"
 
-		// Stage 1: Initialize kvcached system
-		result := C.kvcached_bridge_init_kvcached(device, 1)
-		if result != 0 {
-			slog.Warn("Failed to initialize kvcached, continuing without it", "error", result)
-		} else {
-			s.kvCacheInitialized = true
-			slog.Info("Stage 1: kvcached initialized successfully", "device", deviceStr)
-			
-			// Initialize the model's native cache so attention tensors are valid in kvcached mode
-			if mc := s.model.Config().Cache; mc != nil {
-				var numCtx int
-				if parallel > 0 {
-					numCtx = kvSize / parallel
-				} else {
-					numCtx = kvSize
-				}
-				slog.Debug("Initializing model native cache (kvcached mode)")
-				mc.Init(s.model.Backend(), kvCacheTypeFromStr(kvCacheType), parallel, numCtx, s.batchSize)
+		if enableKVCached {
+			// Initialize kvcached with dynamic device detection
+			gpus := discover.GetGPUInfo()
+			slog.Info("Initializing kvcached integration...")
+			deviceStr := "cpu" // Default to CPU
+			if len(gpus) > 0 && gpus[0].Library == "cuda" {
+				deviceStr = "cuda:0" // Use device 0 for now
+			} else if len(gpus) > 0 && gpus[0].Library == "metal" {
+				deviceStr = "metal"
 			}
-			
-			// Stage 2: Allocate KV cache for this model
-			// Get model-specific parameters for KV cache allocation
-			config := s.model.Backend().Config()
-			numBlocks := 1024  // Cache capacity parameter (may be adjusted based on memory)
-			blockSize := 32    // Block size parameter
-			headNum := int(config.Uint("attention.head_count_kv"))   // KV heads from model
-			headDim := int(config.Uint("attention.key_length"))      // Head dimension from model
-			numLayers := int(config.Uint("block_count"))            // Number of layers from model
+			device := C.CString(deviceStr)
+			defer C.free(unsafe.Pointer(device))
 
-			slog.Info("Stage 2: Allocating KV cache with model parameters",
-				"model_arch", config.Architecture(),
-				"head_num", headNum, "head_dim", headDim, "layers", numLayers,
-				"num_blocks", numBlocks, "block_size", blockSize)
-			
-			cacheResult := C.kvcached_bridge_alloc_kv_cache(
-				C.int(numBlocks),
-				C.int(blockSize), 
-				C.int(headNum),
-				C.int(headDim),
-				C.int(numLayers),
-				device)
-				
-			if cacheResult != 0 {
-				slog.Warn("Stage 2: Failed to allocate KV cache, continuing without it", "error", cacheResult)
-				s.kvCacheInitialized = false
+			// Stage 1: Initialize kvcached system
+			result := C.kvcached_bridge_init_kvcached(device, 1)
+			if result != 0 {
+				slog.Warn("Failed to initialize kvcached, continuing without it", "error", result)
 			} else {
-				slog.Info("Stage 2: KV cache allocated successfully", 
-					"blocks", numBlocks, "block_size", blockSize, 
-					"head_num", headNum, "head_dim", headDim, "layers", numLayers)
+				s.kvCacheInitialized = true
+				slog.Info("Stage 1: kvcached initialized successfully", "device", deviceStr)
+
+				// Initialize the model's native cache so attention tensors are valid in kvcached mode
+				if mc := s.model.Config().Cache; mc != nil {
+					var numCtx int
+					if parallel > 0 {
+						numCtx = kvSize / parallel
+					} else {
+						numCtx = kvSize
+					}
+					slog.Debug("Initializing model native cache (kvcached mode)")
+					mc.Init(s.model.Backend(), kvCacheTypeFromStr(kvCacheType), parallel, numCtx, s.batchSize)
+				}
+
+				// Stage 2: Allocate KV cache for this model
+				// Get model-specific parameters for KV cache allocation
+				config := s.model.Backend().Config()
+				numBlocks := 1024  // Cache capacity parameter (may be adjusted based on memory)
+				blockSize := 32    // Block size parameter
+				headNum := int(config.Uint("attention.head_count_kv"))   // KV heads from model
+				headDim := int(config.Uint("attention.key_length"))      // Head dimension from model
+				numLayers := int(config.Uint("block_count"))            // Number of layers from model
+
+				slog.Info("Stage 2: Allocating KV cache with model parameters",
+					"model_arch", config.Architecture(),
+					"head_num", headNum, "head_dim", headDim, "layers", numLayers,
+					"num_blocks", numBlocks, "block_size", blockSize)
+
+				cacheResult := C.kvcached_bridge_alloc_kv_cache(
+					C.int(numBlocks),
+					C.int(blockSize),
+					C.int(headNum),
+					C.int(headDim),
+					C.int(numLayers),
+					device)
+
+				if cacheResult != 0 {
+					slog.Warn("Stage 2: Failed to allocate KV cache, continuing without it", "error", cacheResult)
+					s.kvCacheInitialized = false
+				} else {
+					slog.Info("Stage 2: KV cache allocated successfully",
+						"blocks", numBlocks, "block_size", blockSize,
+						"head_num", headNum, "head_dim", headDim, "layers", numLayers)
+				}
 			}
 		}
 	}
