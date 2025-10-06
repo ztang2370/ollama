@@ -607,7 +607,6 @@ func (c *Causal) Put(ctx ml.Context, key, value ml.Tensor) {
 			info := c.kvCacheTensorInfos[c.curLayer]
 			fullTensor := c.ctxs[c.curLayer].(*ggml.Context).FromExternalMemory(info.Dtype, info.DataPtr, info.Shape...)
 			// Create key tensor: [headDim, numKVHeads, seqLen]
-			fullTensor = fullTensor.Contiguous(c.ctxs[c.curLayer])
 			seqLen := info.Shape[1]
 			numKVHeads := info.Shape[2]
 			headDim := info.Shape[3]
