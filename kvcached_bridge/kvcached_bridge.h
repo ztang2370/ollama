@@ -22,6 +22,21 @@ typedef enum {
     LOG_ERROR = 3
 } log_level_t;
 
+// Tensor information structure for returning allocated tensors
+typedef struct {
+    void* data_ptr;      // Pointer to tensor data
+    long long shape[4];  // Tensor shape (max 4 dimensions for KV cache)
+    int ndim;            // Number of dimensions
+    int dtype_size;      // Size of each element in bytes
+} tensor_info_t;
+
+// Return structure for alloc_kv_cache function
+typedef struct {
+    int result;                    // 0 for success, negative for error
+    tensor_info_t* tensors;        // Array of tensor info for each layer
+    int num_tensors;               // Number of tensors returned
+} alloc_result_t;
+
 // Initialize the Python bridge
 int kvcached_bridge_init();
 
@@ -29,7 +44,7 @@ int kvcached_bridge_init();
 int kvcached_bridge_init_kvcached(const char* device, int async_sched);
 
 // Call Python alloc_kv_cache function (Stage 2)
-int kvcached_bridge_alloc_kv_cache(int num_blocks, int block_size, int head_num, int head_dim, int num_layers, const char* device);
+alloc_result_t kvcached_bridge_alloc_kv_cache(int num_blocks, int block_size, int head_num, int head_dim, int num_layers, const char* device);
 
 // Call Python alloc_kv_bridge function (Stage 3 - allocate blocks for a request)
 long long* kvcached_bridge_alloc_kv(int num_blocks);

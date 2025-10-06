@@ -8,6 +8,7 @@ import (
 	"slices"
 
 	"github.com/ollama/ollama/ml"
+	ggml "github.com/ollama/ollama/ml/backend/ggml"
 	"github.com/ollama/ollama/model/input"
 )
 
@@ -77,10 +78,15 @@ type Causal struct {
 
 	// ** cache data storage **
 
-	shiftFn      shiftFn
-	backend      ml.Backend
-	ctxs         map[int]ml.Context
-	keys, values map[int]ml.Tensor
+	shiftFn            shiftFn
+	backend            ml.Backend
+	ctxs               map[int]ml.Context
+	keys, values       map[int]ml.Tensor
+	kvCacheTensorInfos []*KvcachedTensorInfo
+}
+
+func (c *Causal) SetKVCacheTensorInfo(info []*KvcachedTensorInfo) {
+	c.kvCacheTensorInfos = info
 }
 
 type cacheCell struct {
@@ -592,18 +598,64 @@ func (c *Causal) Put(ctx ml.Context, key, value ml.Tensor) {
 	}
 
 	if _, ok := c.ctxs[c.curLayer]; !ok {
-		c.ctxs[c.curLayer] = c.backend.NewContextSize(2).Layer(c.curLayer)
+		c.ctxs[c.curLayer] = c.backend.NewContextSize(16).Layer(c.curLayer)
 	}
 
 	if _, ok := c.keys[c.curLayer]; !ok {
-		c.keys[c.curLayer] = c.ctxs[c.curLayer].Zeros(c.DType, kHeadDim, numKVHeads, len(c.cells))
+		if c.kvCacheTensorInfos != nil && c.curLayer < len(c.kvCacheTensorInfos) {
+			// Create tensor lazily from kvcached memory
+			info := c.kvCacheTensorInfos[c.curLayer]
+			fullTensor := c.ctxs[c.curLayer].(*ggml.Context).FromExternalMemory(info.Dtype, info.DataPtr, info.Shape...)
+			// Create key tensor: [headDim, numKVHeads, seqLen]
+			fullTensor = fullTensor.Contiguous(c.ctxs[c.curLayer])
+			seqLen := info.Shape[1]
+			numKVHeads := info.Shape[2]
+			headDim := info.Shape[3]
+			elementSize := 2 // F16, TODO: calculate from info.Dtype
+			keyTensor := fullTensor.View(c.ctxs[c.curLayer], 0,
+				headDim, elementSize,
+				numKVHeads, headDim*elementSize,
+				seqLen)
+			c.keys[c.curLayer] = keyTensor
+		} else {
+			c.keys[c.curLayer] = c.ctxs[c.curLayer].Zeros(c.DType, kHeadDim, numKVHeads, len(c.cells))
+		}
 	}
 
 	if _, ok := c.values[c.curLayer]; !ok {
-		if c.config.PermutedV {
-			c.values[c.curLayer] = c.ctxs[c.curLayer].Zeros(c.DType, len(c.cells), vHeadDim, numKVHeads)
+		if c.kvCacheTensorInfos != nil && c.curLayer < len(c.kvCacheTensorInfos) {
+			// Create tensor lazily from kvcached memory
+			info := c.kvCacheTensorInfos[c.curLayer]
+			fullTensor := c.ctxs[c.curLayer].(*ggml.Context).FromExternalMemory(info.Dtype, info.DataPtr, info.Shape...)
+
+			seqLen := info.Shape[1]
+			numKVHeads := info.Shape[2]
+			headDim := info.Shape[3]
+			elementSize := 2 // F16
+			// Offset to values: size of one [seqLen, numKVHeads, headDim] slice
+			valueOffset := seqLen * numKVHeads * headDim * elementSize
+
+			if c.config.PermutedV {
+				// Memory layout is [seqLen, numKVHeads, headDim], want [seqLen, headDim, numKVHeads]
+				valueTensor := fullTensor.View(c.ctxs[c.curLayer], valueOffset,
+					seqLen, elementSize,
+					headDim, seqLen*elementSize,
+					numKVHeads)
+				c.values[c.curLayer] = valueTensor
+			} else {
+				// Memory layout is [seqLen, numKVHeads, headDim], want [headDim, numKVHeads, seqLen]
+				valueTensor := fullTensor.View(c.ctxs[c.curLayer], valueOffset,
+					headDim, elementSize,
+					numKVHeads, headDim*elementSize,
+					seqLen)
+				c.values[c.curLayer] = valueTensor
+			}
 		} else {
-			c.values[c.curLayer] = c.ctxs[c.curLayer].Zeros(c.DType, vHeadDim, numKVHeads, len(c.cells))
+			if c.config.PermutedV {
+				c.values[c.curLayer] = c.ctxs[c.curLayer].Zeros(c.DType, len(c.cells), vHeadDim, numKVHeads)
+			} else {
+				c.values[c.curLayer] = c.ctxs[c.curLayer].Zeros(c.DType, vHeadDim, numKVHeads, len(c.cells))
+			}
 		}
 	}
 

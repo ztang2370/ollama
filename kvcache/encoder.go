@@ -139,6 +139,10 @@ func (c *EncoderCache) Put(ctx ml.Context, key, value ml.Tensor) {
 	)
 }
 
+func (c *EncoderCache) SetKVCacheTensorInfo(info []*KvcachedTensorInfo) {
+	// Encoder cache doesn't use kvcached tensor info
+}
+
 func (c *EncoderCache) CopyPrefix(srcSeq, dstSeq int, len int32) {
 	panic("encoder cache does not support multiple sequences")
 }

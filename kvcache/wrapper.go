@@ -81,6 +81,14 @@ func (c *WrapperCache) Put(ctx ml.Context, key, value ml.Tensor) {
 	c.caches[c.curType].Put(ctx, key, value)
 }
 
+func (c *WrapperCache) SetKVCacheTensorInfo(info []*KvcachedTensorInfo) {
+	for _, cache := range c.caches {
+		if causal, ok := cache.(*Causal); ok {
+			causal.SetKVCacheTensorInfo(info)
+		}
+	}
+}
+
 func (c *WrapperCache) CopyPrefix(srcSeq, dstSeq int, len int32) {
 	for _, cache := range c.caches {
 		cache.CopyPrefix(srcSeq, dstSeq, len)

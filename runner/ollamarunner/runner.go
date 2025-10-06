@@ -38,6 +38,7 @@ import (
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/discover"
 	"github.com/ollama/ollama/envconfig"
+	"github.com/ollama/ollama/kvcache"
 	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/logutil"
 	"github.com/ollama/ollama/ml"
@@ -322,7 +323,7 @@ type Server struct {
 
 	// kvcached integration
 	kvCacheInitialized bool
-	kvCachePtr uintptr // Reference to allocated virtual memory
+	kvCacheTensorInfos []*kvcache.KvcachedTensorInfo // Info for dynamic tensor creation
 
 	// multimodalHash generates hashes for comparing equality
 	// of non-text data
@@ -379,7 +380,7 @@ func (s *Server) removeSequence(seqIndex int, reason llm.DoneReason) {
 	// Mark cache slot as available for reuse but preserve kvcached blocks
 	seq.cache.InUse = false
 	seq.cache.lastUsed = time.Now()
-	
+
 	slog.Debug("Sequence completed, preserving kvcached blocks for conversation continuity",
 		"slot", seq.cache.Id, "blocks", len(seq.cache.kvCacheBlocks))
 
@@ -410,6 +411,8 @@ func (s *Server) processBatch() error {
 	}
 	defer s.mu.Unlock()
 
+	// For kvcached, we need larger context memory for tensor metadata
+	// NewContext() already creates the maximum allowed context size
 	ctx := s.model.Backend().NewContext()
 	defer ctx.Close()
 
@@ -518,8 +521,8 @@ func (s *Server) processBatch() error {
 		// Check if this is a CUDA memory access error, which indicates kvcached memory issue
 		errStr := err.Error()
 		if strings.Contains(errStr, "illegal memory access") ||
-		   strings.Contains(errStr, "cuda") ||
-		   strings.Contains(errStr, "CUDA") {
+			strings.Contains(errStr, "cuda") ||
+			strings.Contains(errStr, "CUDA") {
 			slog.Warn("CUDA memory access error detected, likely due to kvcached memory mapping issue. Consider using native cache for CUDA devices.")
 
 			// For now, re-raise the error. In a production system, you might want to:
@@ -899,10 +902,6 @@ func (s *Server) reserveWorstCaseGraph() error {
 
 	ctx.Forward(t).Reserve()
 
-	if s.kvCacheInitialized {
-		slog.Debug("kvcached enabled - native WrapperCache in use (memory managed by kvcached)")
-	}
-
 	return nil
 }
 
@@ -981,11 +980,11 @@ func (s *Server) allocModel(
 				// Stage 2: Allocate KV cache for this model
 				// Get model-specific parameters for KV cache allocation
 				config := s.model.Backend().Config()
-				numBlocks := 1024  // Cache capacity parameter (may be adjusted based on memory)
-				blockSize := 32    // Block size parameter
-				headNum := int(config.Uint("attention.head_count_kv"))   // KV heads from model
-				headDim := int(config.Uint("attention.key_length"))      // Head dimension from model
-				numLayers := int(config.Uint("block_count"))            // Number of layers from model
+				numBlocks := 1024                                      // Cache capacity parameter (may be adjusted based on memory)
+				blockSize := 32                                        // Block size parameter
+				headNum := int(config.Uint("attention.head_count_kv")) // KV heads from model
+				headDim := int(config.Uint("attention.key_length"))    // Head dimension from model
+				numLayers := int(config.Uint("block_count"))           // Number of layers from model
 
 				slog.Info("Stage 2: Allocating KV cache with model parameters",
 					"model_arch", config.Architecture(),
@@ -1000,13 +999,45 @@ func (s *Server) allocModel(
 					C.int(numLayers),
 					device)
 
-				if cacheResult != 0 {
-					slog.Warn("Stage 2: Failed to allocate KV cache, continuing without it", "error", cacheResult)
+				if cacheResult.result != 0 {
+					slog.Warn("Stage 2: Failed to allocate KV cache, continuing without it", "error", cacheResult.result)
 					s.kvCacheInitialized = false
 				} else {
 					slog.Info("Stage 2: KV cache allocated successfully",
 						"blocks", numBlocks, "block_size", blockSize,
-						"head_num", headNum, "head_dim", headDim, "layers", numLayers)
+						"head_num", headNum, "head_dim", headDim, "layers", numLayers,
+						"num_tensors", cacheResult.num_tensors)
+
+					// Store kvcached memory information for later tensor creation
+					// We'll create the actual tensors dynamically in the cache when needed
+					kvcachedTensors := make([]*kvcache.KvcachedTensorInfo, cacheResult.num_tensors)
+
+					for i := 0; i < int(cacheResult.num_tensors); i++ {
+						tensorInfo := *(*C.tensor_info_t)(unsafe.Pointer(uintptr(unsafe.Pointer(cacheResult.tensors)) + uintptr(i)*unsafe.Sizeof(C.tensor_info_t{})))
+
+						info := &kvcache.KvcachedTensorInfo{
+							DataPtr: tensorInfo.data_ptr,
+							Shape:   make([]int, int(tensorInfo.ndim)),
+							Dtype:   ml.DTypeF32, // Default
+						}
+
+						for j := 0; j < int(tensorInfo.ndim); j++ {
+							info.Shape[j] = int(tensorInfo.shape[j])
+						}
+
+						switch tensorInfo.dtype_size {
+						case 2:
+							info.Dtype = ml.DTypeF16
+						default:
+							info.Dtype = ml.DTypeF32
+						}
+
+						kvcachedTensors[i] = info
+						slog.Debug("Stored kvcached tensor info", "layer", i, "shape", info.Shape, "dtype", info.Dtype)
+					}
+
+					// Store tensor info for dynamic creation
+					s.kvCacheTensorInfos = kvcachedTensors
 				}
 			}
 		}
@@ -1015,6 +1046,15 @@ func (s *Server) allocModel(
 	s.cache, err = NewInputCache(s.model, kvCacheType, int32(kvSize), parallel, s.batchSize, multiUserCache, s.kvCacheInitialized)
 	if err != nil {
 		return err
+	}
+
+	// Set kvcached tensor info on the cache for lazy creation
+	if s.kvCacheInitialized && len(s.kvCacheTensorInfos) > 0 {
+		if cache := s.model.Config().Cache; cache != nil {
+			// Set the tensor info for lazy creation
+			cache.SetKVCacheTensorInfo(s.kvCacheTensorInfos)
+			slog.Info("Set kvcached tensor info on model cache", "num_layers", len(s.kvCacheTensorInfos))
+		}
 	}
 
 	if !s.cache.enabled && parallel > 1 {
@@ -1026,13 +1066,13 @@ func (s *Server) allocModel(
 	s.seqs = make([]*Sequence, s.parallel)
 	s.seqsSem = semaphore.NewWeighted(int64(s.parallel))
 
-    if s.kvCacheInitialized {
-        // With kvcached enabled, skip ggml warmup graph to avoid cache/tensor setup pitfalls
-        slog.Debug("Skipping reserveWorstCaseGraph (kvcached enabled)")
-        return nil
-    }
-	
-    return s.reserveWorstCaseGraph()
+	if s.kvCacheInitialized {
+		// With kvcached enabled, skip ggml warmup graph to avoid cache/tensor setup pitfalls
+		slog.Debug("Skipping reserveWorstCaseGraph (kvcached enabled)")
+		return nil
+	}
+
+	return s.reserveWorstCaseGraph()
 }
 
 // closeModel frees all memory associated with a model
@@ -1199,12 +1239,12 @@ func Execute(args []string) error {
 	}
 
 	log.Println("Server listening on", addr)
-        if err := httpServer.Serve(listener); err != nil {
-                log.Fatal("server error:", err)
-                return err
-        }
+	if err := httpServer.Serve(listener); err != nil {
+		log.Fatal("server error:", err)
+		return err
+	}
 
-        return nil
+	return nil
 }
 
 // kvcached manages virtual memory automatically - no manual token-level updates needed
@@ -1220,5 +1260,4 @@ func (s *Server) shutdownKVCache() {
 		slog.Warn("Failed to shutdown kvcached", "error", result)
 	}
 	s.kvCacheInitialized = false
-	s.kvCachePtr = 0
 }

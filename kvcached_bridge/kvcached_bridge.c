@@ -65,6 +65,8 @@ typedef struct {
     } data;
     int result;
     long long* result_blocks;
+    tensor_info_t* result_tensors;  // Array of tensor info for each layer
+    int num_result_tensors;         // Number of tensors returned
     int processed;  // Flag to indicate processing is complete
 } bridge_message_t;
 
@@ -175,12 +177,59 @@ void* python_thread_func(void* arg) {
 
                         PyObject* pResult = PyObject_CallObject(pFunc, pArgs);
                         if (pResult && PyList_Check(pResult)) {
-                            cbridge_log(LOG_DEBUG, "alloc_kv_cache succeeded");
+                            int num_tensors = PyList_Size(pResult);
+                            cbridge_log(LOG_DEBUG, "alloc_kv_cache succeeded, got %d tensors", num_tensors);
+
+                            // Allocate memory for tensor info array
+                            msg->result_tensors = (tensor_info_t*)malloc(num_tensors * sizeof(tensor_info_t));
+                            msg->num_result_tensors = num_tensors;
                             msg->result = 0;
+
+                            // Extract tensor information from each tensor
+                            for (int i = 0; i < num_tensors; i++) {
+                                PyObject* tensor = PyList_GetItem(pResult, i);
+                                if (tensor) {
+                                    // Get data pointer
+                                    PyObject* data_ptr_method = PyObject_GetAttrString(tensor, "data_ptr");
+                                    if (data_ptr_method) {
+                                        PyObject* data_ptr_result = PyObject_CallObject(data_ptr_method, NULL);
+                                        if (data_ptr_result) {
+                                            msg->result_tensors[i].data_ptr = (void*)PyLong_AsLongLong(data_ptr_result);
+                                            Py_DECREF(data_ptr_result);
+                                        }
+                                        Py_DECREF(data_ptr_method);
+                                    }
+
+                                    // Get shape
+                                    PyObject* shape_attr = PyObject_GetAttrString(tensor, "shape");
+                                    if (shape_attr && PyTuple_Check(shape_attr)) {
+                                        msg->result_tensors[i].ndim = PyTuple_Size(shape_attr);
+                                        for (int j = 0; j < msg->result_tensors[i].ndim && j < 4; j++) {
+                                            PyObject* dim = PyTuple_GetItem(shape_attr, j);
+                                            msg->result_tensors[i].shape[j] = PyLong_AsLongLong(dim);
+                                        }
+                                        Py_DECREF(shape_attr);
+                                    }
+
+                                    // Get dtype size
+                                    PyObject* dtype_attr = PyObject_GetAttrString(tensor, "dtype");
+                                    if (dtype_attr) {
+                                        PyObject* itemsize_attr = PyObject_GetAttrString(dtype_attr, "itemsize");
+                                        if (itemsize_attr) {
+                                            msg->result_tensors[i].dtype_size = PyLong_AsLong(itemsize_attr);
+                                            Py_DECREF(itemsize_attr);
+                                        }
+                                        Py_DECREF(dtype_attr);
+                                    }
+                                }
+                            }
+
                             Py_DECREF(pResult);
                         } else {
                             cbridge_log(LOG_ERROR, "alloc_kv_cache failed");
                             msg->result = -1;
+                            msg->result_tensors = NULL;
+                            msg->num_result_tensors = 0;
                             PyErr_Print();
                         }
                         Py_DECREF(pArgs);
@@ -188,10 +237,14 @@ void* python_thread_func(void* arg) {
                     } else {
                         cbridge_log(LOG_ERROR, "cannot find alloc_kv_cache function");
                         msg->result = -1;
+                        msg->result_tensors = NULL;
+                        msg->num_result_tensors = 0;
                     }
                 } else {
                     cbridge_log(LOG_ERROR, "kvcached module not available");
                     msg->result = -1;
+                    msg->result_tensors = NULL;
+                    msg->num_result_tensors = 0;
                 }
 
                 main_thread_state = PyEval_SaveThread();
@@ -437,7 +490,7 @@ int kvcached_bridge_init_kvcached(const char* device, int async_sched) {
 }
 
 // Call Python alloc_kv_cache function (Stage 2)
-int kvcached_bridge_alloc_kv_cache(int num_blocks, int block_size, int head_num, int head_dim, int num_layers, const char* device) {
+alloc_result_t kvcached_bridge_alloc_kv_cache(int num_blocks, int block_size, int head_num, int head_dim, int num_layers, const char* device) {
     cbridge_log(LOG_INFO, "alloc_kv_cache called: blocks=%d, head=(%d,%d), layers=%d, device=%s",
                 num_blocks, head_num, head_dim, num_layers, device);
 
@@ -451,8 +504,14 @@ int kvcached_bridge_alloc_kv_cache(int num_blocks, int block_size, int head_num,
     msg.data.alloc_cache.device = device;
 
     int result = send_message(&msg);
-    cbridge_log(LOG_INFO, "alloc_kv_cache result=%d", result);
-    return result;
+    cbridge_log(LOG_INFO, "alloc_kv_cache result=%d, num_tensors=%d", result, msg.num_result_tensors);
+
+    alloc_result_t alloc_result;
+    alloc_result.result = result;
+    alloc_result.tensors = msg.result_tensors;
+    alloc_result.num_tensors = msg.num_result_tensors;
+
+    return alloc_result;
 }
 
 // Call Python shutdown_kvcached function

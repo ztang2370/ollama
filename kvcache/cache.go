@@ -2,10 +2,17 @@ package kvcache
 
 import (
 	"errors"
+	"unsafe"
 
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/model/input"
 )
+
+type KvcachedTensorInfo struct {
+	DataPtr unsafe.Pointer
+	Shape   []int
+	Dtype   ml.DType
+}
 
 var (
 	ErrKvCacheFull  = errors.New("could not find a kv cache slot")
@@ -40,6 +47,8 @@ type Cache interface {
 	//
 	// Most models will not need to use this.
 	SetConfig(ml.CacheConfig)
+
+	SetKVCacheTensorInfo(info []*KvcachedTensorInfo)
 
 	// ** cache management **
 

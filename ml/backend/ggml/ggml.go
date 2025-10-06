@@ -925,6 +925,56 @@ func (c *Context) FromIntSlice(s []int32, shape ...int) ml.Tensor {
 	return t
 }
 
+func (c *Context) FromExternalMemory(dtype ml.DType, data unsafe.Pointer, shape ...int) ml.Tensor {
+	// Create tensor with external memory reference for kvcached integration
+
+	cdtype := ggmlDType(dtype)
+
+	var t *C.struct_ggml_tensor
+	if len(shape) < 1 || shape[0] == 0 {
+		var shape C.int64_t = 0
+		t = C.ggml_new_tensor(c.ctx, cdtype, 1, &shape)
+	} else {
+		if len(shape) > 4 {
+			panic("unsupported number of dimensions")
+		}
+		for _, dim := range shape {
+			if dim < 1 {
+				panic("invalid shape")
+			}
+		}
+		t = C.ggml_new_tensor(c.ctx, cdtype, C.int(len(shape)), shapeToGGML(shape))
+	}
+
+	// For external memory tensors, assign to CPU buffer to avoid GPU allocation
+	// External memory is managed separately, so CPU buffer assignment prevents GGML GPU allocation
+	cpuDev := C.ggml_backend_dev_by_type(C.GGML_BACKEND_DEVICE_TYPE_CPU)
+	if cpuDev == nil {
+		panic("failed to get CPU device for external memory tensor")
+	}
+	cpuBuft := C.ggml_backend_dev_buffer_type(cpuDev)
+	if cpuBuft == nil {
+		panic("failed to get CPU buffer type for external memory tensor")
+	}
+
+	minBufferSize := C.size_t(1024)
+	b := C.ggml_backend_buft_alloc_buffer(cpuBuft, minBufferSize)
+	if b == nil {
+		panic("failed to allocate CPU buffer for external memory tensor")
+	}
+
+	// Directly assign buffer to tensor
+	t.buffer = b
+
+	// Set data pointer to external kvcached memory
+	t.data = data
+
+	// Add to allocated buffers for cleanup
+	*c.allocatedBuffers = append(*c.allocatedBuffers, b)
+
+	return &Tensor{b: c.b, t: t}
+}
+
 func (c Context) Arange(start, stop, step float32, dtype ml.DType) ml.Tensor {
 	switch dtype {
 	case ml.DTypeF32:
